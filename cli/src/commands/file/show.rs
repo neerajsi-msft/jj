@@ -52,6 +52,10 @@ pub(crate) struct FileShowArgs {
     #[arg(add = ArgValueCompleter::new(complete::revset_expression_all))]
     revision: RevisionArg,
 
+    /// Show the file as a merge of multiple revisions
+    #[arg(long, short = 'm')]
+    merge: bool,
+
     /// Render each file metadata using the given template
     ///
     /// All 0-argument methods of the [`TreeEntry` type] are available as
@@ -82,10 +86,21 @@ pub(crate) async fn cmd_file_show(
     args: &FileShowArgs,
 ) -> Result<(), CommandError> {
     let workspace_command = command.workspace_helper(ui)?;
-    let commit = workspace_command
-        .resolve_single_rev(ui, &args.revision)
-        .await?;
-    let tree = commit.tree();
+    let tree;
+    if args.merge {
+        use futures::TryStreamExt as _;
+        let commits: Vec<_> = workspace_command
+            .parse_union_revsets(ui, std::slice::from_ref(&args.revision))?
+            .evaluate_to_commits()?
+            .try_collect()
+            .await?;
+        tree = jj_lib::rewrite::merge_commit_trees(workspace_command.repo().as_ref(), &commits).await?;
+    } else {
+        let commit = workspace_command
+            .resolve_single_rev(ui, &args.revision)
+            .await?;
+        tree = commit.tree();
+    }
     // TODO: No need to add special case for empty paths when switching to
     // parse_union_filesets(). paths = [] should be "none()" if supported.
     let fileset_expression = workspace_command.parse_file_patterns(ui, &args.paths)?;

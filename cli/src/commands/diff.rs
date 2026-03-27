@@ -84,6 +84,10 @@ pub(crate) struct DiffArgs {
     #[arg(add = ArgValueCompleter::new(complete::revset_expression_all))]
     to: Option<RevisionArg>,
 
+    /// Evaluate the revisions as a virtual merge
+    #[arg(long, short = 'm')]
+    merge: bool,
+
     /// Restrict the diff to these paths
     #[arg(value_name = "FILESETS", value_hint = clap::ValueHint::AnyPath)]
     #[arg(add = ArgValueCompleter::new(complete::modified_revision_or_range_files))]
@@ -128,66 +132,101 @@ pub(crate) async fn cmd_diff(
     let to_tree;
     let mut copy_records = CopyRecords::default();
     if args.from.is_some() || args.to.is_some() {
-        let resolve_revision = async |r: &Option<RevisionArg>| {
-            workspace_command
-                .resolve_single_rev(ui, r.as_ref().unwrap_or(&RevisionArg::AT))
-                .await
+        let resolve_revisions = async |r: &Option<RevisionArg>| {
+            let rev_arg = r.as_ref().unwrap_or(&RevisionArg::AT);
+            if args.merge {
+                let commits: Vec<_> = workspace_command
+                    .parse_union_revsets(ui, std::slice::from_ref(rev_arg))?
+                    .evaluate_to_commits()?
+                    .try_collect()
+                    .await?;
+                Result::<Vec<_>, CommandError>::Ok(commits)
+            } else {
+                let commit = workspace_command.resolve_single_rev(ui, rev_arg).await?;
+                Result::<Vec<_>, CommandError>::Ok(vec![commit])
+            }
         };
-        let from = resolve_revision(&args.from).await?;
-        let to = resolve_revision(&args.to).await?;
-        from_tree = from.tree();
-        to_tree = to.tree();
+        let from_commits = resolve_revisions(&args.from).await?;
+        let to_commits = resolve_revisions(&args.to).await?;
+        from_tree = merge_commit_trees(repo.as_ref(), &from_commits).await?;
+        to_tree = merge_commit_trees(repo.as_ref(), &to_commits).await?;
 
-        let records = get_copy_records(repo.store(), from.id(), to.id(), &matcher).await?;
-        copy_records.add_records(records);
+        for f in &from_commits {
+            for t in &to_commits {
+                let records = get_copy_records(repo.store(), f.id(), t.id(), &matcher).await?;
+                copy_records.add_records(records);
+            }
+        }
     } else {
         let revision_args = args
             .revisions
             .as_deref()
             .unwrap_or(std::slice::from_ref(&RevisionArg::AT));
         let revisions_evaluator = workspace_command.parse_union_revsets(ui, revision_args)?;
-        let target_expression = revisions_evaluator.expression();
-        let mut gaps_revset = workspace_command
-            .attach_revset_evaluator(
-                target_expression
-                    .roots()
-                    .range(&target_expression.heads())
-                    .minus(target_expression),
-            )
-            .evaluate_to_commit_ids()?;
-        if let Some(commit_id) = gaps_revset.try_next().await? {
-            return Err(
-                user_error("Cannot diff revsets with gaps in.").hinted(format!(
-                    "Revision {} would need to be in the set.",
-                    short_commit_hash(&commit_id)
-                )),
-            );
-        }
-        let heads: Vec<_> = workspace_command
-            .attach_revset_evaluator(target_expression.heads())
-            .evaluate_to_commits()?
-            .try_collect()
-            .await?;
-        let roots: Vec<_> = workspace_command
-            .attach_revset_evaluator(target_expression.roots())
-            .evaluate_to_commits()?
-            .try_collect()
-            .await?;
+        if args.merge {
+            let commits: Vec<_> = revisions_evaluator
+                .evaluate_to_commits()?
+                .try_collect()
+                .await?;
+            let parents_set: IndexSet<_> = try_join_all(commits.iter().map(|c| c.parents()))
+                .await?
+                .into_iter()
+                .flatten()
+                .collect();
+            let parents = parents_set.into_iter().collect_vec();
+            from_tree = merge_commit_trees(repo.as_ref(), &parents).await?;
+            to_tree = merge_commit_trees(repo.as_ref(), &commits).await?;
 
-        // Collect parents outside of revset to preserve parent order
-        let parents: IndexSet<_> = try_join_all(roots.iter().map(|c| c.parents()))
-            .await?
-            .into_iter()
-            .flatten()
-            .collect();
-        let parents = parents.into_iter().collect_vec();
-        from_tree = merge_commit_trees(repo.as_ref(), &parents).await?;
-        to_tree = merge_commit_trees(repo.as_ref(), &heads).await?;
+            for p in &parents {
+                for to in &commits {
+                    let records = get_copy_records(repo.store(), p.id(), to.id(), &matcher).await?;
+                    copy_records.add_records(records);
+                }
+            }
+        } else {
+            let target_expression = revisions_evaluator.expression();
+            let mut gaps_revset = workspace_command
+                .attach_revset_evaluator(
+                    target_expression
+                        .roots()
+                        .range(&target_expression.heads())
+                        .minus(target_expression),
+                )
+                .evaluate_to_commit_ids()?;
+            if let Some(commit_id) = gaps_revset.try_next().await? {
+                return Err(
+                    user_error("Cannot diff revsets with gaps in.").hinted(format!(
+                        "Revision {} would need to be in the set.",
+                        short_commit_hash(&commit_id)
+                    )),
+                );
+            }
+            let heads: Vec<_> = workspace_command
+                .attach_revset_evaluator(target_expression.heads())
+                .evaluate_to_commits()?
+                .try_collect()
+                .await?;
+            let roots: Vec<_> = workspace_command
+                .attach_revset_evaluator(target_expression.roots())
+                .evaluate_to_commits()?
+                .try_collect()
+                .await?;
 
-        for p in &parents {
-            for to in &heads {
-                let records = get_copy_records(repo.store(), p.id(), to.id(), &matcher).await?;
-                copy_records.add_records(records);
+            // Collect parents outside of revset to preserve parent order
+            let parents: IndexSet<_> = try_join_all(roots.iter().map(|c| c.parents()))
+                .await?
+                .into_iter()
+                .flatten()
+                .collect();
+            let parents = parents.into_iter().collect_vec();
+            from_tree = merge_commit_trees(repo.as_ref(), &parents).await?;
+            to_tree = merge_commit_trees(repo.as_ref(), &heads).await?;
+
+            for p in &parents {
+                for to in &heads {
+                    let records = get_copy_records(repo.store(), p.id(), to.id(), &matcher).await?;
+                    copy_records.add_records(records);
+                }
             }
         }
     }
