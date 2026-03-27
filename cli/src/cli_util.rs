@@ -108,7 +108,7 @@ use jj_lib::repo_path::RepoPath;
 use jj_lib::repo_path::RepoPathBuf;
 use jj_lib::repo_path::RepoPathUiConverter;
 use jj_lib::repo_path::UiPathParseError;
-use jj_lib::revset;
+use jj_lib::revset::{self, ResolvedDiffExpression, ResolvedTreeExpression};
 use jj_lib::revset::ResolvedRevsetExpression;
 use jj_lib::revset::RevsetAliasesMap;
 use jj_lib::revset::RevsetDiagnostics;
@@ -1785,6 +1785,41 @@ to the current parents may contain changes from multiple commits.
         let expression = revset::parse(&mut diagnostics, revision_arg.as_ref(), &context)?;
         print_parse_diagnostics(ui, "In revset expression", &diagnostics)?;
         Ok(self.attach_revset_evaluator(expression))
+    }
+    pub fn parse_tree(
+        &self,
+        ui: &Ui,
+        revision_arg: &RevisionArg,
+    ) -> Result<ResolvedTreeExpression, CommandError> {
+        let mut diagnostics = RevsetDiagnostics::new();
+        let context = self.env.revset_parse_context();
+        let expression = revset::parse_tree(&mut diagnostics, revision_arg.as_ref(), &context)?;
+        print_parse_diagnostics(ui, "In tree expression", &diagnostics)?;
+        let symbol_resolver = crate::revset_util::default_symbol_resolver(
+            self.repo().as_ref(),
+            self.env.command.revset_extensions().symbol_resolvers(),
+            self.id_prefix_context(),
+        );
+        let resolved = expression.resolve_user_expression(self.repo().as_ref(), &symbol_resolver)?;
+        Ok(resolved)
+    }
+
+    pub fn parse_diff(
+        &self,
+        ui: &Ui,
+        revision_arg: &RevisionArg,
+    ) -> Result<ResolvedDiffExpression, CommandError> {
+        let mut diagnostics = RevsetDiagnostics::new();
+        let context = self.env.revset_parse_context();
+        let expression = revset::parse_diff(&mut diagnostics, revision_arg.as_ref(), &context)?;
+        print_parse_diagnostics(ui, "In diff expression", &diagnostics)?;
+        let symbol_resolver = crate::revset_util::default_symbol_resolver(
+            self.repo().as_ref(),
+            self.env.command.revset_extensions().symbol_resolvers(),
+            self.id_prefix_context(),
+        );
+        let resolved = expression.resolve_user_expression(self.repo().as_ref(), &symbol_resolver)?;
+        Ok(resolved)
     }
 
     /// Parses the given revset expressions and concatenates them all.

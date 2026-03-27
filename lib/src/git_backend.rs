@@ -490,20 +490,6 @@ impl GitBackend {
         ))
     }
 
-    fn read_tree_for_commit<'repo>(
-        &self,
-        repo: &'repo gix::Repository,
-        id: &CommitId,
-    ) -> BackendResult<gix::Tree<'repo>> {
-        let tree = self.read_commit(id).block_on()?.root_tree;
-        // TODO(kfm): probably want to do something here if it is a merge
-        let tree_id = tree.first().clone();
-        let gix_id = validate_git_object_id(&tree_id)?;
-        repo.find_object(gix_id)
-            .map_err(|err| map_not_found_err(err, &tree_id))?
-            .try_into_tree()
-            .map_err(|err| to_read_object_err(err, &tree_id))
-    }
 
     // Similar to gix's write_blob, but compute the hash outside our lock to
     // reduce contention.
@@ -666,7 +652,7 @@ fn commit_from_git_without_root_parent(
         .iter()
         // gix does not recognize gpgsig-sha256, but prevent future footguns by checking for it too
         .any(|(k, _)| *k == "gpgsig" || *k == "gpgsig-sha256")
-        .then(|| CommitRefIter::signature(&git_object.data))
+        .then(|| CommitRefIter::signature(&git_object.data, gix::hash::Kind::Sha1))
         .transpose()
         .map_err(decode_err)?
         .flatten()
@@ -1409,12 +1395,24 @@ impl Backend for GitBackend {
     fn get_copy_records(
         &self,
         paths: Option<&[RepoPathBuf]>,
-        root_id: &CommitId,
-        head_id: &CommitId,
+        root_id: &TreeId,
+        head_id: &TreeId,
     ) -> BackendResult<BoxStream<'_, BackendResult<CopyRecord>>> {
         let repo = self.git_repo();
-        let root_tree = self.read_tree_for_commit(&repo, root_id)?;
-        let head_tree = self.read_tree_for_commit(&repo, head_id)?;
+        let root_tree = {
+            let gix_id = validate_git_object_id(root_id)?;
+            repo.find_object(gix_id)
+                .map_err(|err| map_not_found_err(err, root_id))?
+                .try_into_tree()
+                .map_err(|err| to_read_object_err(err, root_id))?
+        };
+        let head_tree = {
+            let gix_id = validate_git_object_id(head_id)?;
+            repo.find_object(gix_id)
+                .map_err(|err| map_not_found_err(err, head_id))?
+                .try_into_tree()
+                .map_err(|err| to_read_object_err(err, head_id))?
+        };
 
         let change_to_copy_record =
             |change: gix::object::tree::diff::Change| -> BackendResult<Option<CopyRecord>> {
@@ -1447,17 +1445,15 @@ impl Backend for GitBackend {
 
                 Ok(Some(CopyRecord {
                     target,
-                    target_commit: head_id.clone(),
                     source: RepoPathBuf::from_internal_string(source).unwrap(),
                     source_file: FileId::from_bytes(source_id.as_bytes()),
-                    source_commit: root_id.clone(),
                 }))
             };
 
         let mut records: Vec<BackendResult<CopyRecord>> = Vec::new();
         root_tree
             .changes()
-            .map_err(|err| BackendError::Other(err.into()))?
+            .map_err(|err| BackendError::Other(Box::new(err)))?
             .options(|opts| {
                 opts.track_path().track_rewrites(Some(gix::diff::Rewrites {
                     copies: Some(gix::diff::rewrites::Copies {
@@ -1481,7 +1477,7 @@ impl Backend for GitBackend {
                     Ok(gix::object::tree::diff::Action::Continue(()))
                 },
             )
-            .map_err(|err| BackendError::Other(err.into()))?;
+            .map_err(|err| BackendError::Other(Box::new(err)))?;
         Ok(futures::stream::iter(records).boxed())
     }
 
@@ -1879,7 +1875,9 @@ mod tests {
     #[test]
     fn change_id_parsing() {
         let id = |commit_object_bytes: &[u8]| {
-            extract_change_id_from_commit(&CommitRef::from_bytes(commit_object_bytes).unwrap())
+            extract_change_id_from_commit(
+                &CommitRef::from_bytes(commit_object_bytes, gix::hash::Kind::Sha1).unwrap(),
+            )
         };
 
         let commit_with_id = indoc! {b"

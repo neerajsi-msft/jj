@@ -99,10 +99,16 @@ pub(crate) async fn cmd_status(
             if wc_has_changes {
                 writeln!(formatter, "Working copy changes:")?;
                 let mut copy_records = CopyRecords::default();
-                for parent in wc_commit.parent_ids() {
-                    let records =
-                        get_copy_records(repo.store(), parent, wc_commit.id(), &matcher).await?;
-                    copy_records.add_records(records);
+                let wc_tree_id = wc_commit.tree_ids();
+                for parent_id in wc_commit.parent_ids() {
+                    let parent = repo.store().get_commit(parent_id)?;
+                    for f_id in parent.tree_ids().iter() {
+                        for t_id in wc_tree_id.iter() {
+                            let records =
+                                get_copy_records(repo.store(), f_id, t_id, &matcher).await?;
+                            copy_records.add_records(records);
+                        }
+                    }
                 }
                 let diff_renderer = workspace_command.diff_renderer(vec![DiffFormat::Summary]);
                 let width = ui.term_width();

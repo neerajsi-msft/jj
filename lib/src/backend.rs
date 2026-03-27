@@ -222,8 +222,6 @@ pub struct Commit {
 pub struct CopyRecord {
     /// The destination of the copy, B.
     pub target: RepoPathBuf,
-    /// The CommitId where the copy took place.
-    pub target_commit: CommitId,
     /// The source path a target was copied from.
     ///
     /// It is not required that the source path is different than the target
@@ -232,17 +230,6 @@ pub struct CopyRecord {
     pub source: RepoPathBuf,
     /// The file id of the source file.
     pub source_file: FileId,
-    /// The source commit the target was copied from. Backends may use this
-    /// field to implement 'integration' logic, where a source may be
-    /// periodically merged into a target, similar to a branch, but the
-    /// branching occurs at the file level rather than the repository level. It
-    /// also follows naturally that any copy source targeted to a specific
-    /// commit should avoid copy propagation on rebasing, which is desirable
-    /// for 'fork' style copies.
-    ///
-    /// It is required that the commit id is an ancestor of the commit with
-    /// which this copy source is associated.
-    pub source_commit: CommitId,
 }
 
 /// Describes the copy history of a file. The copy object is unchanged when a
@@ -661,8 +648,8 @@ pub trait Backend: Any + Send + Sync + Debug {
     fn get_copy_records(
         &self,
         paths: Option<&[RepoPathBuf]>,
-        root: &CommitId,
-        head: &CommitId,
+        root: &TreeId,
+        head: &TreeId,
     ) -> BackendResult<BoxStream<'_, BackendResult<CopyRecord>>>;
 
     /// Perform garbage collection.

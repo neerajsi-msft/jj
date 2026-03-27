@@ -43,15 +43,20 @@ pub async fn cmd_debug_copy_detection(
 
     let commit = ws.resolve_single_rev(ui, &args.revision).await?;
     for parent_id in commit.parent_ids() {
-        let mut records = store.get_copy_records(None, parent_id, commit.id())?;
-        while let Some(result) = records.next().await {
-            if let Ok(CopyRecord { target, source, .. }) = result {
-                writeln!(
-                    ui.stdout(),
-                    "{} -> {}",
-                    source.as_internal_file_string(),
-                    target.as_internal_file_string()
-                )?;
+        let parent = store.get_commit(parent_id)?;
+        for f_id in parent.tree_ids().iter() {
+            for t_id in commit.tree_ids().iter() {
+                let mut records = store.get_copy_records(None, f_id, t_id)?;
+                while let Some(result) = records.next().await {
+                    if let Ok(CopyRecord { target, source, .. }) = result {
+                        writeln!(
+                            ui.stdout(),
+                            "{} -> {}",
+                            source.as_internal_file_string(),
+                            target.as_internal_file_string()
+                        )?;
+                    }
+                }
             }
         }
     }

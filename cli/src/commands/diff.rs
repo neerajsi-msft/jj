@@ -14,22 +14,16 @@
 
 use clap_complete::ArgValueCandidates;
 use clap_complete::ArgValueCompleter;
-use futures::TryStreamExt as _;
-use futures::future::try_join_all;
-use indexmap::IndexSet;
 use itertools::Itertools as _;
 use jj_lib::copies::CopyRecords;
 use jj_lib::merge::Diff;
 use jj_lib::repo::Repo as _;
-use jj_lib::rewrite::merge_commit_trees;
 use tracing::instrument;
 
 use crate::cli_util::CommandHelper;
 use crate::cli_util::RevisionArg;
 use crate::cli_util::print_unmatched_explicit_paths;
-use crate::cli_util::short_commit_hash;
 use crate::command_error::CommandError;
-use crate::command_error::user_error;
 use crate::complete;
 use crate::diff_util::DiffFormatArgs;
 use crate::diff_util::get_copy_records;
@@ -84,6 +78,7 @@ pub(crate) struct DiffArgs {
     #[arg(add = ArgValueCompleter::new(complete::revset_expression_all))]
     to: Option<RevisionArg>,
 
+
     /// Restrict the diff to these paths
     #[arg(value_name = "FILESETS", value_hint = clap::ValueHint::AnyPath)]
     #[arg(add = ArgValueCompleter::new(complete::modified_revision_or_range_files))]
@@ -128,65 +123,36 @@ pub(crate) async fn cmd_diff(
     let to_tree;
     let mut copy_records = CopyRecords::default();
     if args.from.is_some() || args.to.is_some() {
-        let resolve_revision = async |r: &Option<RevisionArg>| {
-            workspace_command
-                .resolve_single_rev(ui, r.as_ref().unwrap_or(&RevisionArg::AT))
-                .await
-        };
-        let from = resolve_revision(&args.from).await?;
-        let to = resolve_revision(&args.to).await?;
-        from_tree = from.tree();
-        to_tree = to.tree();
+        let from_arg = args.from.as_ref().unwrap_or(&RevisionArg::AT);
+        let to_arg = args.to.as_ref().unwrap_or(&RevisionArg::AT);
+        let from_expr = workspace_command.parse_tree(ui, from_arg)?;
+        let to_expr = workspace_command.parse_tree(ui, to_arg)?;
+        
+        from_tree = from_expr.evaluate(repo.as_ref()).await?;
+        to_tree = to_expr.evaluate(repo.as_ref()).await?;
 
-        let records = get_copy_records(repo.store(), from.id(), to.id(), &matcher).await?;
-        copy_records.add_records(records);
+        for f_id in from_tree.tree_ids().iter() {
+            for t_id in to_tree.tree_ids().iter() {
+                let records = get_copy_records(repo.store(), f_id, t_id, &matcher).await?;
+                copy_records.add_records(records);
+            }
+        }
     } else {
         let revision_args = args
             .revisions
             .as_deref()
             .unwrap_or(std::slice::from_ref(&RevisionArg::AT));
-        let revisions_evaluator = workspace_command.parse_union_revsets(ui, revision_args)?;
-        let target_expression = revisions_evaluator.expression();
-        let mut gaps_revset = workspace_command
-            .attach_revset_evaluator(
-                target_expression
-                    .roots()
-                    .range(&target_expression.heads())
-                    .minus(target_expression),
-            )
-            .evaluate_to_commit_ids()?;
-        if let Some(commit_id) = gaps_revset.try_next().await? {
-            return Err(
-                user_error("Cannot diff revsets with gaps in.").hinted(format!(
-                    "Revision {} would need to be in the set.",
-                    short_commit_hash(&commit_id)
-                )),
-            );
-        }
-        let heads: Vec<_> = workspace_command
-            .attach_revset_evaluator(target_expression.heads())
-            .evaluate_to_commits()?
-            .try_collect()
-            .await?;
-        let roots: Vec<_> = workspace_command
-            .attach_revset_evaluator(target_expression.roots())
-            .evaluate_to_commits()?
-            .try_collect()
-            .await?;
+        
+        let rev_string = revision_args.iter().map(|arg| arg.as_ref()).join("|");
+        let rev_arg = RevisionArg::from(rev_string);
+        let diff_expr = workspace_command.parse_diff(ui, &rev_arg)?;
+        let (f_tree, t_tree) = diff_expr.evaluate(repo.as_ref()).await?;
+        from_tree = f_tree;
+        to_tree = t_tree;
 
-        // Collect parents outside of revset to preserve parent order
-        let parents: IndexSet<_> = try_join_all(roots.iter().map(|c| c.parents()))
-            .await?
-            .into_iter()
-            .flatten()
-            .collect();
-        let parents = parents.into_iter().collect_vec();
-        from_tree = merge_commit_trees(repo.as_ref(), &parents).await?;
-        to_tree = merge_commit_trees(repo.as_ref(), &heads).await?;
-
-        for p in &parents {
-            for to in &heads {
-                let records = get_copy_records(repo.store(), p.id(), to.id(), &matcher).await?;
+        for f_id in from_tree.tree_ids().iter() {
+            for t_id in to_tree.tree_ids().iter() {
+                let records = get_copy_records(repo.store(), f_id, t_id, &matcher).await?;
                 copy_records.add_records(records);
             }
         }

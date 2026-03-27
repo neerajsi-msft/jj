@@ -198,8 +198,8 @@ impl Backend for SecretBackend {
     fn get_copy_records(
         &self,
         paths: Option<&[RepoPathBuf]>,
-        root: &CommitId,
-        head: &CommitId,
+        root: &TreeId,
+        head: &TreeId,
     ) -> BackendResult<BoxStream<'_, BackendResult<CopyRecord>>> {
         self.inner.get_copy_records(paths, root, head)
     }

@@ -30,7 +30,7 @@ use futures::stream::BoxStream;
 use itertools::Itertools as _;
 use jj_lib::backend::BackendError;
 use jj_lib::backend::BackendResult;
-use jj_lib::backend::CommitId;
+use jj_lib::backend::TreeId;
 use jj_lib::backend::CopyRecord;
 use jj_lib::backend::TreeValue;
 use jj_lib::commit::Commit;
@@ -668,9 +668,14 @@ impl<'a> DiffRenderer<'a> {
         let to_tree = commit.tree();
         let mut copy_records = CopyRecords::default();
         for parent_id in commit.parent_ids() {
-            let records =
-                get_copy_records(self.repo.store(), parent_id, commit.id(), matcher).await?;
-            copy_records.add_records(records);
+            let parent = self.repo.store().get_commit(parent_id)?;
+            for f_id in parent.tree_ids().iter() {
+                for t_id in commit.tree_ids().iter() {
+                    let records =
+                        get_copy_records(self.repo.store(), f_id, t_id, matcher).await?;
+                    copy_records.add_records(records);
+                }
+            }
         }
         self.show_diff(
             ui,
@@ -686,8 +691,8 @@ impl<'a> DiffRenderer<'a> {
 
 pub async fn get_copy_records(
     store: &Store,
-    root: &CommitId,
-    head: &CommitId,
+    root: &TreeId,
+    head: &TreeId,
     matcher: &dyn Matcher,
 ) -> BackendResult<Vec<CopyRecord>> {
     // TODO: teach backend about matching path prefixes?

@@ -26,6 +26,8 @@ use std::sync::LazyLock;
 
 use futures::Stream;
 use futures::StreamExt as _;
+use futures::TryStreamExt as _;
+use futures::future::LocalBoxFuture;
 use futures::stream::LocalBoxStream;
 use itertools::Itertools as _;
 use pollster::FutureExt as _;
@@ -47,6 +49,7 @@ use crate::id_prefix::IdPrefixContext;
 use crate::id_prefix::IdPrefixIndex;
 use crate::index::ResolvedChangeTargets;
 use crate::object_id::HexPrefix;
+use crate::object_id::ObjectId;
 use crate::object_id::PrefixResolution;
 use crate::op_store::LocalRemoteRefTarget;
 use crate::op_store::RefTarget;
@@ -62,7 +65,11 @@ use crate::repo::ReadonlyRepo;
 use crate::repo::Repo;
 use crate::repo::RepoLoaderError;
 use crate::repo_path::RepoPathUiConverter;
+use crate::rewrite::merge_commit_trees;
+use crate::merged_tree::MergedTree;
+use crate::merge::Merge;
 use crate::revset_parser;
+use indexmap::IndexSet;
 pub use crate::revset_parser::BinaryOp;
 pub use crate::revset_parser::ExpressionKind;
 pub use crate::revset_parser::ExpressionNode;
@@ -230,9 +237,9 @@ pub enum RevsetFilterPredicate {
 
 mod private {
     /// Defines [`RevsetExpression`] variants depending on resolution state.
-    pub trait ExpressionState {
-        type CommitRef: Clone;
-        type Operation: Clone;
+    pub trait ExpressionState: std::fmt::Debug {
+        type CommitRef: Clone + std::fmt::Debug;
+        type Operation: Clone + std::fmt::Debug;
     }
 
     // Not constructible because these state types just define associated types.
@@ -260,6 +267,77 @@ impl ExpressionState for ResolvedExpressionState {
 pub type UserRevsetExpression = RevsetExpression<UserExpressionState>;
 /// [`RevsetExpression`] that never contains unresolved commit refs.
 pub type ResolvedRevsetExpression = RevsetExpression<ResolvedExpressionState>;
+
+/// Tree expression describing tree operations.
+#[derive(Clone, Debug)]
+pub enum TreeExpression<St: ExpressionState> {
+    CommitTree(Arc<RevsetExpression<St>>),
+    MergedOf(Vec<Arc<TreeExpression<St>>>),
+    MergedParents(Arc<RevsetExpression<St>>),
+    ConflictSide {
+        revset: Arc<RevsetExpression<St>>,
+        side: usize,
+    },
+    RebaseOf {
+        base: Arc<TreeExpression<St>>,
+        revsets: Arc<RevsetExpression<St>>,
+    },
+    RevertOf {
+        base: Arc<TreeExpression<St>>,
+        diff: Arc<DiffExpression<St>>,
+    },
+}
+
+pub type UserTreeExpression = TreeExpression<UserExpressionState>;
+pub type ResolvedTreeExpression = TreeExpression<ResolvedExpressionState>;
+
+/// Diff expression describing diff operations.
+#[derive(Clone, Debug)]
+pub enum DiffExpression<St: ExpressionState> {
+    Diff(Arc<TreeExpression<St>>, Arc<TreeExpression<St>>),
+    Inverted(Arc<DiffExpression<St>>),
+    Revset(Arc<RevsetExpression<St>>),
+}
+
+pub type UserDiffExpression = DiffExpression<UserExpressionState>;
+pub type ResolvedDiffExpression = DiffExpression<ResolvedExpressionState>;
+
+/// A generalized query expression that evaluates to a revset, tree, or diff.
+#[derive(Clone, Debug)]
+pub enum QueryExpression<St: ExpressionState> {
+    Revset(Arc<RevsetExpression<St>>),
+    Tree(Arc<TreeExpression<St>>),
+    Diff(Arc<DiffExpression<St>>),
+}
+
+impl<St: ExpressionState> QueryExpression<St> {
+    pub fn expect_revset(self) -> Result<Arc<RevsetExpression<St>>, &'static str> {
+        match self {
+            QueryExpression::Revset(r) => Ok(r),
+            QueryExpression::Tree(_) => Err("Expected a revset, got a tree"),
+            QueryExpression::Diff(_) => Err("Expected a revset, got a diff"),
+        }
+    }
+
+    pub fn expect_tree(self) -> Result<Arc<TreeExpression<St>>, &'static str> {
+        match self {
+            QueryExpression::Tree(t) => Ok(t),
+            QueryExpression::Revset(r) => Ok(Arc::new(TreeExpression::CommitTree(r))),
+            QueryExpression::Diff(_) => Err("Expected a tree, got a diff"),
+        }
+    }
+
+    pub fn expect_diff(self) -> Result<Arc<DiffExpression<St>>, &'static str> {
+        match self {
+            QueryExpression::Diff(d) => Ok(d),
+            QueryExpression::Revset(r) => Ok(Arc::new(DiffExpression::Revset(r))),
+            QueryExpression::Tree(_) => Err("Expected a diff, got a tree"),
+        }
+    }
+}
+
+pub type UserQueryExpression = QueryExpression<UserExpressionState>;
+pub type ResolvedQueryExpression = QueryExpression<ResolvedExpressionState>;
 
 /// Tree of revset expressions describing DAG operations.
 ///
@@ -672,6 +750,204 @@ impl UserRevsetExpression {
         symbol_resolver: &SymbolResolver,
     ) -> Result<Arc<ResolvedRevsetExpression>, RevsetResolutionError> {
         resolve_symbols(repo, self, symbol_resolver)
+    }
+}
+
+impl UserQueryExpression {
+    pub fn resolve_user_expression(
+        &self,
+        repo: &dyn Repo,
+        symbol_resolver: &SymbolResolver,
+    ) -> Result<ResolvedQueryExpression, RevsetResolutionError> {
+        match self {
+            QueryExpression::Revset(r) => Ok(QueryExpression::Revset(
+                r.resolve_user_expression(repo, symbol_resolver)?,
+            )),
+            QueryExpression::Tree(t) => Ok(QueryExpression::Tree(Arc::new(
+                t.resolve_user_expression(repo, symbol_resolver)?,
+            ))),
+            QueryExpression::Diff(d) => Ok(QueryExpression::Diff(Arc::new(
+                d.resolve_user_expression(repo, symbol_resolver)?,
+            ))),
+        }
+    }
+}
+
+impl UserTreeExpression {
+    pub fn resolve_user_expression(
+        &self,
+        repo: &dyn Repo,
+        symbol_resolver: &SymbolResolver,
+    ) -> Result<TreeExpression<ResolvedExpressionState>, RevsetResolutionError> {
+        match self {
+            TreeExpression::CommitTree(r) => Ok(TreeExpression::CommitTree(
+                r.resolve_user_expression(repo, symbol_resolver)?,
+            )),
+            TreeExpression::MergedOf(trees) => {
+                let mut resolved_trees = Vec::with_capacity(trees.len());
+                for t in trees {
+                    resolved_trees.push(Arc::new(t.resolve_user_expression(repo, symbol_resolver)?));
+                }
+                Ok(TreeExpression::MergedOf(resolved_trees))
+            }
+            TreeExpression::MergedParents(r) => Ok(TreeExpression::MergedParents(
+                r.resolve_user_expression(repo, symbol_resolver)?,
+            )),
+            TreeExpression::ConflictSide { revset, side } => Ok(TreeExpression::ConflictSide {
+                revset: revset.resolve_user_expression(repo, symbol_resolver)?,
+                side: *side,
+            }),
+            TreeExpression::RebaseOf { base, revsets } => Ok(TreeExpression::RebaseOf {
+                base: Arc::new(base.resolve_user_expression(repo, symbol_resolver)?),
+                revsets: revsets.resolve_user_expression(repo, symbol_resolver)?,
+            }),
+            TreeExpression::RevertOf { base, diff } => Ok(TreeExpression::RevertOf {
+                base: Arc::new(base.resolve_user_expression(repo, symbol_resolver)?),
+                diff: Arc::new(diff.resolve_user_expression(repo, symbol_resolver)?),
+            }),
+        }
+    }
+}
+
+impl UserDiffExpression {
+    pub fn resolve_user_expression(
+        &self,
+        repo: &dyn Repo,
+        symbol_resolver: &SymbolResolver,
+    ) -> Result<DiffExpression<ResolvedExpressionState>, RevsetResolutionError> {
+        match self {
+            DiffExpression::Diff(from, to) => Ok(DiffExpression::Diff(
+                Arc::new(from.resolve_user_expression(repo, symbol_resolver)?),
+                Arc::new(to.resolve_user_expression(repo, symbol_resolver)?),
+            )),
+            DiffExpression::Inverted(diff) => Ok(DiffExpression::Inverted(Arc::new(
+                diff.resolve_user_expression(repo, symbol_resolver)?,
+            ))),
+            DiffExpression::Revset(r) => Ok(DiffExpression::Revset(
+                r.resolve_user_expression(repo, symbol_resolver)?,
+            )),
+        }
+    }
+}
+
+impl ResolvedTreeExpression {
+    pub fn evaluate<'index>(
+        &'index self,
+        repo: &'index dyn Repo,
+    ) -> LocalBoxFuture<'index, Result<MergedTree, RevsetEvaluationError>> {
+        Box::pin(async move {
+            match self {
+                TreeExpression::CommitTree(revset) => {
+                    let commits: Vec<_> = revset
+                        .clone()
+                        .evaluate(repo)?
+                        .stream()
+                        .commits(repo.store())
+                        .try_collect()
+                        .await?;
+                    if commits.len() == 1 {
+                        Ok(commits[0].tree())
+                    } else if commits.is_empty() {
+                        Err(RevsetEvaluationError::Other(
+                            "Cannot evaluate tree for empty revset".into(),
+                        ))
+                    } else {
+                        Err(RevsetEvaluationError::Other(
+                            format!("Expected exactly one commit to evaluate as a tree, got {}", commits.len()).into(),
+                        ))
+                    }
+                }
+                TreeExpression::MergedOf(trees) => {
+                    if trees.is_empty() {
+                        return Err(RevsetEvaluationError::Other(
+                            "Cannot merge 0 trees".into(),
+                        ));
+                    }
+                    let mut results = Vec::new();
+                    for tree in trees {
+                        let evaluated_tree = tree.evaluate(repo).await?;
+                        results.push((evaluated_tree, "".to_string()));
+                    }
+                    Ok(MergedTree::merge_no_resolve(Merge::from_vec(results)))
+                }
+                TreeExpression::MergedParents(revset) => {
+                    let commits: Vec<_> = revset
+                        .clone()
+                        .evaluate(repo)?
+                        .stream()
+                        .commits(repo.store())
+                        .try_collect()
+                        .await?;
+                    let mut parent_commits = IndexSet::new();
+                    for commit in &commits {
+                        for parent_id in commit.parent_ids() {
+                            parent_commits.insert(repo.store().get_commit_async(parent_id).await.map_err(|e| RevsetEvaluationError::Other(e.into()))?);
+                        }
+                    }
+                    let parent_commits_vec: Vec<_> = parent_commits.into_iter().collect();
+                    if parent_commits_vec.is_empty() {
+                        Ok(repo.store().empty_merged_tree())
+                    } else {
+                        Ok(merge_commit_trees(repo, &parent_commits_vec).await?)
+                    }
+                }
+                TreeExpression::ConflictSide { revset: _, side: _ } => {
+                    Err(RevsetEvaluationError::Other("conflict_side not implemented yet".into()))
+                }
+                TreeExpression::RebaseOf { base: _, revsets: _ } => {
+                    Err(RevsetEvaluationError::Other("rebase_of not implemented yet".into()))
+                }
+                TreeExpression::RevertOf { base: _, diff: _ } => {
+                    Err(RevsetEvaluationError::Other("revert_of not implemented yet".into()))
+                }
+            }
+        })
+    }
+}
+
+impl ResolvedDiffExpression {
+    pub fn evaluate<'index>(
+        &'index self,
+        repo: &'index dyn Repo,
+    ) -> LocalBoxFuture<'index, Result<(MergedTree, MergedTree), RevsetEvaluationError>> {
+        Box::pin(async move {
+            match self {
+                DiffExpression::Diff(from, to) => {
+                    let from_tree = from.evaluate(repo).await?;
+                    let to_tree = to.evaluate(repo).await?;
+                    Ok((from_tree, to_tree))
+                }
+                DiffExpression::Inverted(diff) => {
+                    let (from, to) = diff.evaluate(repo).await?;
+                    Ok((to, from))
+                }
+                DiffExpression::Revset(revset) => {
+                    let gaps_expr = revset.roots().range(&revset.heads()).minus(revset);
+                    let mut gaps = gaps_expr.evaluate(repo)?.stream();
+                    if let Some(commit_id_res) = gaps.next().await {
+                        let commit_id = commit_id_res?;
+                        return Err(RevsetEvaluationError::Other(
+                            format!("Cannot diff revsets with gaps in. Revision {} would need to be in the set.", commit_id.hex()).into(),
+                        ));
+                    }
+                    
+                    let heads: Vec<_> = revset.heads().evaluate(repo)?.stream().commits(repo.store()).try_collect().await?;
+                    let roots: Vec<_> = revset.roots().evaluate(repo)?.stream().commits(repo.store()).try_collect().await?;
+                    
+                    let mut parents = IndexSet::new();
+                    for root in roots {
+                        for parent_id in root.parent_ids() {
+                            parents.insert(repo.store().get_commit_async(parent_id).await.map_err(|e: BackendError| RevsetEvaluationError::Other(e.into()))?);
+                        }
+                    }
+                    let parents: Vec<_> = parents.into_iter().collect();
+                    
+                    let from_tree = merge_commit_trees(repo, &parents).await?;
+                    let to_tree = merge_commit_trees(repo, &heads).await?;
+                    Ok((from_tree, to_tree))
+                }
+            }
+        })
     }
 }
 
@@ -1362,15 +1638,119 @@ fn parse_remote_refs_arguments(
     Ok(RemoteRefSymbolExpression { name, remote })
 }
 
+pub type QueryFunction = fn(
+    &mut RevsetDiagnostics,
+    &FunctionCallNode,
+    &LoweringContext,
+) -> Result<UserQueryExpression, RevsetParseError>;
+
+static BUILTIN_QUERY_FUNCTION_MAP: LazyLock<HashMap<&str, QueryFunction>> = LazyLock::new(|| {
+    let mut map: HashMap<&str, QueryFunction> = HashMap::new();
+    map.insert("tree", |diagnostics, function, context| {
+        let ([arg], []) = function.expect_arguments()?;
+        let revset = lower_expression(diagnostics, arg, context)?;
+        Ok(UserQueryExpression::Tree(Arc::new(
+            UserTreeExpression::CommitTree(revset),
+        )))
+    });
+    map.insert("merged_of", |diagnostics, function, context| {
+        let mut trees = Vec::new();
+        for arg in &function.args {
+            let query = lower_query(diagnostics, arg, context)?;
+            trees.push(query.expect_tree().map_err(|e| {
+                RevsetParseError::with_span(RevsetParseErrorKind::TypeError(e), arg.span)
+            })?);
+        }
+        Ok(UserQueryExpression::Tree(Arc::new(
+            UserTreeExpression::MergedOf(trees),
+        )))
+    });
+    map.insert("merged_parents", |diagnostics, function, context| {
+        let ([arg], []) = function.expect_arguments()?;
+        let revset = lower_expression(diagnostics, arg, context)?;
+        // Sugar for merged_of(parents(revset))
+        Ok(UserQueryExpression::Tree(Arc::new(
+            UserTreeExpression::MergedParents(revset),
+        )))
+    });
+    map.insert("conflict_side", |diagnostics, function, context| {
+        let ([arg1, arg2], []) = function.expect_arguments()?;
+        let revset = lower_expression(diagnostics, arg1, context)?;
+        let side: usize = expect_literal("integer", arg2)?;
+        Ok(UserQueryExpression::Tree(Arc::new(
+            UserTreeExpression::ConflictSide { revset, side },
+        )))
+    });
+    map.insert("rebase_of", |diagnostics, function, context| {
+        let ([arg1, arg2], []) = function.expect_arguments()?;
+        let base = lower_query(diagnostics, arg1, context)?
+            .expect_tree()
+            .map_err(|e| {
+                RevsetParseError::with_span(RevsetParseErrorKind::TypeError(e), arg1.span)
+            })?;
+        let revsets = lower_expression(diagnostics, arg2, context)?;
+        Ok(UserQueryExpression::Tree(Arc::new(
+            UserTreeExpression::RebaseOf { base, revsets },
+        )))
+    });
+    map.insert("revert_of", |diagnostics, function, context| {
+        let ([arg1, arg2], []) = function.expect_arguments()?;
+        let base = lower_query(diagnostics, arg1, context)?
+            .expect_tree()
+            .map_err(|e| {
+                RevsetParseError::with_span(RevsetParseErrorKind::TypeError(e), arg1.span)
+            })?;
+        let diff = lower_query(diagnostics, arg2, context)?
+            .expect_diff()
+            .map_err(|e| {
+                RevsetParseError::with_span(RevsetParseErrorKind::TypeError(e), arg2.span)
+            })?;
+        Ok(UserQueryExpression::Tree(Arc::new(
+            UserTreeExpression::RevertOf { base, diff },
+        )))
+    });
+    map.insert("diff", |diagnostics, function, context| {
+        let ([arg1, arg2], []) = function.expect_arguments()?;
+        let from_tree = lower_query(diagnostics, arg1, context)?
+            .expect_tree()
+            .map_err(|e| {
+                RevsetParseError::with_span(RevsetParseErrorKind::TypeError(e), arg1.span)
+            })?;
+        let to_tree = lower_query(diagnostics, arg2, context)?
+            .expect_tree()
+            .map_err(|e| {
+                RevsetParseError::with_span(RevsetParseErrorKind::TypeError(e), arg2.span)
+            })?;
+        Ok(UserQueryExpression::Diff(Arc::new(
+            UserDiffExpression::Diff(from_tree, to_tree),
+        )))
+    });
+    map.insert("invert", |diagnostics, function, context| {
+        let ([arg], []) = function.expect_arguments()?;
+        let diff = lower_query(diagnostics, arg, context)?
+            .expect_diff()
+            .map_err(|e| {
+                RevsetParseError::with_span(RevsetParseErrorKind::TypeError(e), arg.span)
+            })?;
+        Ok(UserQueryExpression::Diff(Arc::new(
+            UserDiffExpression::Inverted(diff),
+        )))
+    });
+    map
+});
+
 /// Resolves function call by using the given function map.
 fn lower_function_call(
     diagnostics: &mut RevsetDiagnostics,
     function: &FunctionCallNode,
     context: &LoweringContext,
-) -> Result<Arc<UserRevsetExpression>, RevsetParseError> {
+) -> Result<UserQueryExpression, RevsetParseError> {
+    if let Some(func) = BUILTIN_QUERY_FUNCTION_MAP.get(function.name) {
+        return func(diagnostics, function, context);
+    }
     let function_map = &context.extensions.function_map;
     if let Some(func) = function_map.get(function.name) {
-        func(diagnostics, function, context)
+        func(diagnostics, function, context).map(UserQueryExpression::Revset)
     } else {
         Err(RevsetParseError::with_span(
             RevsetParseErrorKind::NoSuchFunction {
@@ -1445,10 +1825,38 @@ pub fn lower_expression(
             Ok(RevsetExpression::union_all(&expressions))
         }
         ExpressionKind::FunctionCall(function) => {
-            lower_function_call(diagnostics, function, context)
+            let query = lower_function_call(diagnostics, function, context)?;
+            query.expect_revset().map_err(|e| {
+                RevsetParseError::with_span(RevsetParseErrorKind::TypeError(e), node.span)
+            })
         }
         ExpressionKind::AliasExpanded(..) => unreachable!(),
     })
+}
+
+pub fn lower_query(
+    diagnostics: &mut RevsetDiagnostics,
+    node: &ExpressionNode,
+    context: &LoweringContext,
+) -> Result<UserQueryExpression, RevsetParseError> {
+    revset_parser::catch_aliases(diagnostics, node, |diagnostics, node| match &node.kind {
+        ExpressionKind::FunctionCall(function) => {
+            lower_function_call(diagnostics, function, context)
+        }
+        _ => lower_expression(diagnostics, node, context).map(UserQueryExpression::Revset),
+    })
+}
+
+pub fn parse_query(
+    diagnostics: &mut RevsetDiagnostics,
+    revset_str: &str,
+    context: &RevsetParseContext,
+) -> Result<UserQueryExpression, RevsetParseError> {
+    let node = parse_program(revset_str)?;
+    let node =
+        dsl_util::expand_aliases_with_locals(node, context.aliases_map, &context.local_variables)?;
+    lower_query(diagnostics, &node, &context.to_lowering_context())
+        .map_err(|err| err.extend_function_candidates(context.aliases_map.function_names()))
 }
 
 pub fn parse(
@@ -1457,10 +1865,46 @@ pub fn parse(
     context: &RevsetParseContext,
 ) -> Result<Arc<UserRevsetExpression>, RevsetParseError> {
     let node = parse_program(revset_str)?;
+    let span = node.span;
     let node =
         dsl_util::expand_aliases_with_locals(node, context.aliases_map, &context.local_variables)?;
-    lower_expression(diagnostics, &node, &context.to_lowering_context())
-        .map_err(|err| err.extend_function_candidates(context.aliases_map.function_names()))
+    let query = lower_query(diagnostics, &node, &context.to_lowering_context())
+        .map_err(|err| err.extend_function_candidates(context.aliases_map.function_names()))?;
+    query
+        .expect_revset()
+        .map_err(|e| RevsetParseError::with_span(RevsetParseErrorKind::TypeError(e), span))
+}
+
+pub fn parse_tree(
+    diagnostics: &mut RevsetDiagnostics,
+    revset_str: &str,
+    context: &RevsetParseContext,
+) -> Result<Arc<UserTreeExpression>, RevsetParseError> {
+    let node = parse_program(revset_str)?;
+    let span = node.span;
+    let node =
+        dsl_util::expand_aliases_with_locals(node, context.aliases_map, &context.local_variables)?;
+    let query = lower_query(diagnostics, &node, &context.to_lowering_context())
+        .map_err(|err| err.extend_function_candidates(context.aliases_map.function_names()))?;
+    query
+        .expect_tree()
+        .map_err(|e| RevsetParseError::with_span(RevsetParseErrorKind::TypeError(e), span))
+}
+
+pub fn parse_diff(
+    diagnostics: &mut RevsetDiagnostics,
+    revset_str: &str,
+    context: &RevsetParseContext,
+) -> Result<Arc<UserDiffExpression>, RevsetParseError> {
+    let node = parse_program(revset_str)?;
+    let span = node.span;
+    let node =
+        dsl_util::expand_aliases_with_locals(node, context.aliases_map, &context.local_variables)?;
+    let query = lower_query(diagnostics, &node, &context.to_lowering_context())
+        .map_err(|err| err.extend_function_candidates(context.aliases_map.function_names()))?;
+    query
+        .expect_diff()
+        .map_err(|e| RevsetParseError::with_span(RevsetParseErrorKind::TypeError(e), span))
 }
 
 /// Parses text into a string matcher expression.

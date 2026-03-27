@@ -195,6 +195,8 @@ pub enum RevsetParseErrorKind {
     InParameterExpansion(String),
     #[error("Alias `{0}` expanded recursively")]
     RecursiveAlias(String),
+    #[error("Type error: {0}")]
+    TypeError(&'static str),
 }
 
 impl RevsetParseError {

@@ -105,8 +105,8 @@ impl Store {
     pub fn get_copy_records(
         &self,
         paths: Option<&[RepoPathBuf]>,
-        root: &CommitId,
-        head: &CommitId,
+        root: &TreeId,
+        head: &TreeId,
     ) -> BackendResult<BoxStream<'_, BackendResult<CopyRecord>>> {
         self.backend.get_copy_records(paths, root, head)
     }

@@ -2342,10 +2342,16 @@ impl TreeDiff {
         matcher: Rc<dyn Matcher>,
     ) -> BackendResult<Self> {
         let mut copy_records = CopyRecords::default();
-        for parent in commit.parent_ids() {
-            let records =
-                diff_util::get_copy_records(repo.store(), parent, commit.id(), &*matcher).await?;
-            copy_records.add_records(records);
+        let commit_tree_ids = commit.tree_ids();
+        for parent_id in commit.parent_ids() {
+            let parent = repo.store().get_commit(parent_id)?;
+            for f_id in parent.tree_ids().iter() {
+                for t_id in commit_tree_ids.iter() {
+                    let records =
+                        diff_util::get_copy_records(repo.store(), f_id, t_id, &*matcher).await?;
+                    copy_records.add_records(records);
+                }
+            }
         }
         Ok(Self {
             from_tree: commit.parent_tree(repo).await?,

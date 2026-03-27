@@ -341,8 +341,8 @@ impl Backend for SimpleBackend {
     fn get_copy_records(
         &self,
         _paths: Option<&[RepoPathBuf]>,
-        _root: &CommitId,
-        _head: &CommitId,
+        _root: &TreeId,
+        _head: &TreeId,
     ) -> BackendResult<BoxStream<'_, BackendResult<CopyRecord>>> {
         Ok(stream::empty().boxed())
     }

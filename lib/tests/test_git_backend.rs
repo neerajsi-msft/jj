@@ -78,7 +78,9 @@ fn get_copy_records(
     a: &Commit,
     b: &Commit,
 ) -> HashMap<String, String> {
-    let stream = store.get_copy_records(paths, a.id(), b.id()).unwrap();
+    let stream = store
+        .get_copy_records(paths, a.tree_ids().first(), b.tree_ids().first())
+        .unwrap();
     let mut res: HashMap<String, String> = HashMap::new();
     for CopyRecord { target, source, .. } in block_on_stream(stream).filter_map(|r| r.ok()) {
         res.insert(
